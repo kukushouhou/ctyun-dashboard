@@ -10,7 +10,8 @@
      逻辑与移动爱家的 SOHO/CAG 逻辑各自留在 Node 侧，彼此不共享保活代码。
      日志也独立：本侧车所有日志经 `event:"log"` 且带 `platform:"ecloud"` 上报。
   2. **调度归 Node**：本侧车**不自建定时器**。保活频率、开关判定、配额全部由
-     Node 的 `scheduler.js` + `taskGate()` 决定，这里只提供「执行一次」的原子操作。
+     Node 的 `scheduler.js` + `taskGate()` 决定；桌面心跳线程只收发当前连接，
+     不自行重连、登录或开机，启动/停止与重试仍由 Node 巡检驱动。
      —— 这样才不会与既有调度器形成第二套真相。
 
 协议（每行一个 JSON，stdout 只承载报文，日志一律走 stderr）：
@@ -34,6 +35,7 @@ ops:
   desktop.power    桌面电源操作（available=开机 / shutdown=关机 / restart=重启，用户显式触发）
   keepalive.l1     账号态保活探针一次（三态：ok=true/false/null）
   keepalive.l2     桌面登记保活一次（desktopUptime）
+  heartbeat.sync  同步需要维持的 CMSSZTE 桌面连接，返回实时心跳状态
   logout           登出并清理会话（含本地落盘记录）
   shutdown         优雅退出
 """
@@ -97,6 +99,7 @@ try:
     from desktop_session import DesktopSession
     import keepalive as keepalive_mod
     import login_rate_limit as rate_limit_mod
+    from desktop_heartbeat import HeartbeatWorker
 except Exception as _e:  # 显式展开错误，绝不吞
     _IMPORT_ERR = f"{type(_e).__name__}: {_e}"
     _config = None
@@ -107,6 +110,16 @@ except Exception as _e:  # 显式展开错误，绝不吞
 # 会话表：sessionId(=账号 id) -> {http, token, ...}
 # --------------------------------------------------------------------------
 _SESSIONS: dict[str, dict] = {}
+_HEARTBEATS: dict[tuple[str, str], HeartbeatWorker] = {}
+_HEARTBEAT_RETRY_MS = 60000
+
+
+def _stop_heartbeats(session_id=None):
+    for key, worker in list(_HEARTBEATS.items()):
+        if session_id is None or key[0] == session_id:
+            worker.stop()
+            if not worker.thread.is_alive():
+                _HEARTBEATS.pop(key, None)
 
 # 自动重登冷却期：即使出现"全端点 token 失效"，也不允许高频密码重登。
 # 实测教训：单点 401 就重登会每 10~20 分钟打一次 /login/verify，
@@ -437,6 +450,7 @@ def op_desktop_list(params: dict) -> dict:
     _require_ready()
     s = _session(params.get("sessionId") or "")
     desktops = desktop_list_mod.get_desktop_list(s["http"])
+    s["desktops"] = {d.instance_id: d for d in desktops}
 
     # 【2026-09-25 用户要求·第七轮】逐台带上"运行中 / 已关机"的运行状态，
     # 供卡片「名下云主机」列表渲染状态徽章（与移动爱家一致）。
@@ -549,8 +563,52 @@ def op_keepalive_l2(params: dict) -> dict:
     }
 
 
+def op_heartbeat_sync(params: dict) -> dict:
+    """Node supplies desired IDs; only authenticated desktop-list entries are used."""
+    _require_ready()
+    sid = params.get("sessionId") or ""
+    wanted = params.get("instanceIds", [])
+    if not sid or not isinstance(wanted, list) or any(not isinstance(i, str) for i in wanted):
+        raise ValueError("heartbeat.sync 需要 sessionId 与 instanceIds 列表")
+    wanted = set(wanted)
+    for key, worker in list(_HEARTBEATS.items()):
+        if key[0] == sid and key[1] not in wanted:
+            worker.stop()
+            if not worker.thread.is_alive():
+                _HEARTBEATS.pop(key, None)
+    if not wanted:
+        return {"desktops": {}}
+    session = _session(sid)
+    desktops = session.get("desktops")
+    if desktops is None:
+        desktops = {d.instance_id: d for d in desktop_list_mod.get_desktop_list(session["http"])}
+        session["desktops"] = desktops
+    output = {}
+    now = int(time.time() * 1000)
+    for iid in wanted:
+        desktop = desktops.get(iid)
+        if desktop is None or desktop.origin_company_code != "CMSSZTE":
+            raise ValueError("所选桌面不存在或不是 CMSSZTE")
+        key = (sid, iid)
+        worker = _HEARTBEATS.get(key)
+        snapshot = worker.snapshot() if worker else {}
+        if worker and not worker.thread.is_alive():
+            due = snapshot.get("finishedAt", now) + _HEARTBEAT_RETRY_MS
+            if snapshot.get("state") == "stopped" or now >= due:
+                worker = None
+        if worker is None:
+            worker = HeartbeatWorker(desktop)
+            _HEARTBEATS[key] = worker
+            worker.start()
+        output[iid] = worker.snapshot()
+        if output[iid].get("state") == "failed":
+            output[iid]["retryAt"] = output[iid]["finishedAt"] + _HEARTBEAT_RETRY_MS
+    return {"desktops": output}
+
+
 def op_logout(params: dict) -> dict:
     sid = params.get("sessionId") or ""
+    _stop_heartbeats(sid)
     s = _SESSIONS.pop(sid, None)
     if s and not _IMPORT_ERR:
         try:
@@ -573,6 +631,7 @@ _OPS = {
     "desktop.power": op_desktop_power,
     "keepalive.l1": op_keepalive_l1,
     "keepalive.l2": op_keepalive_l2,
+    "heartbeat.sync": op_heartbeat_sync,
     "logout": op_logout,
 }
 
@@ -602,6 +661,7 @@ def main() -> int:
                 params["sessionId"] = req.get("sessionId")
 
             if op == "shutdown":
+                _stop_heartbeats()
                 _emit({"id": req_id, "ok": True, "data": {"bye": True}})
                 _emit_log("info", "侧车按指令退出")
                 return 0
@@ -617,6 +677,7 @@ def main() -> int:
                 "error": f"{type(e).__name__}: {e}",
                 "detail": traceback.format_exc()[:2000],
             })
+    _stop_heartbeats()
     _emit_log("info", "stdin 关闭，侧车退出")
     return 0
 

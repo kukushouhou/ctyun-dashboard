@@ -731,9 +731,11 @@ function buildEcloudDesktopMonitorHtml(acc) {
         : ` · 距下次 <b style="color: #0f172a;">${formatEcloudRemainText(view.remainSec)}</b>`;
     }
 
+    const lastLabel = view.heartbeatMode ? '上次桌面登记' : '上次保活';
+    const intervalLabel = view.heartbeatMode ? '登记周期' : '周期';
     const lastText = view.elapsedSec > 0
-      ? `上次保活: <b style="color: #0f172a;">${formatEcloudRemainText(view.elapsedSec)}前</b> · 周期: <b>${intervalText}</b>${nextText}`
-      : `周期: <b>${intervalText}</b>${nextText}`;
+      ? `${lastLabel}: <b style="color: #0f172a;">${formatEcloudRemainText(view.elapsedSec)}前</b> · ${intervalLabel}: <b>${intervalText}</b>${nextText}`
+      : `${intervalLabel}: <b>${intervalText}</b>${nextText}`;
 
     const actionText = (view.lastAction && view.lastAction.text) || (view.enabled ? '待巡检' : (view.disabledReason || '未参与巡检'));
 

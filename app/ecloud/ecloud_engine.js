@@ -340,6 +340,7 @@ class EcloudEngine extends (require('events').EventEmitter) {
   desktopPower(sessionId, p) { return this.request('desktop.power', p, sessionId); }
   keepaliveL1(sessionId) { return this.request('keepalive.l1', {}, sessionId); }
   keepaliveL2(sessionId, p) { return this.request('keepalive.l2', p, sessionId); }
+  syncHeartbeats(sessionId, instanceIds) { return this.request('heartbeat.sync', { instanceIds }, sessionId); }
   logout(sessionId) { return this.request('logout', {}, sessionId); }
 
   /** 优雅退出：先请求 shutdown，超时后强杀。 */
@@ -364,4 +365,4 @@ class EcloudEngine extends (require('events').EventEmitter) {
   }
 }
 
-module.exports = { EcloudEngine, EngineState, resolvePython, ENGINE_DIR, SIDECAR };
+module.exports = { EcloudEngine, EngineState, resolvePython, resolveWorkingPython, ENGINE_DIR, SIDECAR };

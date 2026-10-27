@@ -16,7 +16,7 @@
  *   L1 账号态保活   keepalive.l1  → USER_GET_INFO / USER_GET_DEVICE_INFO / PROBE_QKK_BATCHPUSH
  *                                   三态：ok=true 健康 / ok=false 全失败且 token 失效 / ok=null 全失败但非 token 错误
  *   L2 桌面登记保活 keepalive.l2  → desktopUptime
- *   （原 L3 SPICE 心跳占位层已于 2026-09-26 按用户要求整层删除）
+ *   CMSSZTE 桌面心跳 heartbeat.sync → 持续接收服务器 HEART 并应答；由既有保活开关控制。
  *
  * 诚实性红线（不可放宽）：
  *   1. 三态必须原样保留 —— 把 ok=null 压成 false 会导致每轮密码重登 → 短信轰炸；
@@ -95,10 +95,8 @@ function parseUptimeSeconds(text) {
 const UPTIME_REGRESSION_MIN_SEC = 60;
 
 // ---------------------------------------------------------------------------
-// 【2026-09-26 用户拍板】L3（SPICE 显示面心跳）从未实现 —— 整层删除（UI 到底层）：
-//   开关、探针、metrics.l3、侧车 keepalive.l3 op、Python l3_provider.py 一并移除。
-//   保活分层只保留 L1（账号态）/ L2（桌面登记）；二者是 HTTP 层探针，
-//   "成功 ≠ 云电脑不会被关机"的诚实口径不变。
+// 原先未实现的 L3 开关不恢复。真实桌面连接沿用账号/单机保活开关，
+// 与 L1/L2 的 HTTP 结果分别统计；连接关闭或心跳过期立即失去健康状态。
 // ---------------------------------------------------------------------------
 
 class EcloudClient {
@@ -134,6 +132,7 @@ class EcloudClient {
       this.metrics.engine.offline = true;
       this.metrics.engine.lastExit = info;
       this.metrics.status = 'offline';
+      this.metrics.desktopHeartbeats = {};
       this.metrics.lastHeartbeatResult = `协议引擎已离线 (code=${info && info.code})，保活已停止`;
       this._sessionReady = false;
       // 卡片上的"侧车状态"小徽章已按用户要求移除 ⇒ 引擎离线必须落到日志，绝不静默
@@ -148,6 +147,7 @@ class EcloudClient {
       desktops: account.desktops || [],
       // 单机"当前动作"表：instanceId → { text, level, at }（仅内存，与 ydpc 各自的表各管各的）
       desktopActions: {},
+      desktopHeartbeats: {},
       engine: { state: EngineState.STOPPED, offline: false, lastExit: null, pid: null },
       l1: { lastAt: 0, lastOk: null, lastError: '', okCount: 0, failCount: 0, unknownCount: 0, relogins: 0 },
       l2: { lastAt: 0, lastOk: null, lastError: '', okCount: 0 },
@@ -569,9 +569,58 @@ class EcloudClient {
       if (d.keepaliveEnabled === false) continue;
       out.l2.push({ instanceId: d.instanceId, ...(await this.keepaliveL2(d)) });
     }
+    await this.syncDesktopHeartbeats();
     // 手动「立即保活」也把分层结论写进日志（与自动巡检同一口径、同一函数）
     this._logLayerSummary();
     return out;
+  }
+
+  /** Reconcile sockets through the existing Node loop; Python never schedules retries. */
+  async syncDesktopHeartbeats(stopAll = false) {
+    if (!this.engine.isReady()) { this.metrics.desktopHeartbeats = {}; return; }
+    const generation = this._heartbeatGeneration || 0;
+    const desktops = this.account.desktops || [];
+    const selected = stopAll ? [] : desktops.filter(d =>
+      d.originCompanyCode === 'CMSSZTE' && this.resolveTask('keepAlive', d).enabled &&
+      this._effectivePowerState(d).state !== 'off'
+    ).map(d => String(d.instanceId));
+    const result = await this.engine.syncHeartbeats(this.sessionId, selected);
+    if (generation !== (this._heartbeatGeneration || 0)) {
+      await this.engine.syncHeartbeats(this.sessionId, []);
+      return;
+    }
+    const previous = this.metrics.desktopHeartbeats;
+    this.metrics.desktopHeartbeats = (result && result.desktops) || {};
+    const now = Date.now();
+    for (const d of desktops) {
+      const id = String(d.instanceId);
+      const current = this.metrics.desktopHeartbeats[id];
+      if (!current) continue;
+      const old = previous[id];
+      const changed = !old || old.state !== current.state || old.connectedAt !== current.connectedAt;
+      const reportDue = current.state === 'healthy' && now - (old?._reportedAt || 0) >= 5 * 60 * 1000;
+      current._reportedAt = old?._reportedAt || 0;
+      if (current.tlsWarning && current.tlsWarning !== old?.tlsWarning) {
+        this._log(`[${d.machineName || id}] ${current.tlsWarning}`, 'warning');
+      }
+      if (changed || reportDue) {
+        const action = this._desktopHeartbeatAction(current);
+        this._log(`[${d.machineName || id}] ${action.text}`, current.state === 'failed' ? 'warning' : 'info');
+        current._reportedAt = now;
+      }
+    }
+  }
+
+  _desktopHeartbeatAction(state) {
+    const fresh = state.state === 'healthy' && Date.now() - state.lastHeartbeatAt < 45000;
+    if (fresh) {
+      const seconds = Math.max(0, Math.floor((Date.now() - state.connectedAt) / 1000));
+      return { text: `桌面心跳正常 · 持续连接 ${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒 · 接收 ${state.heartCount} 次 / 应答 ${state.ackCount} 次`, level: 'ok', at: state.lastHeartbeatAt };
+    }
+    const texts = { connecting: '正在建立桌面心跳连接', waiting: '桌面连接已建立，等待连续心跳',
+      stopped: '桌面心跳已停止', failed: `桌面心跳中断：${state.error || '连接已断开'}（稍后重试）`,
+      healthy: '桌面心跳已过期，等待连接检查' };
+    return { text: texts[state.state] || '桌面心跳状态未知', level: state.state === 'failed' || state.state === 'healthy' ? 'error' : 'info', at: Date.now() };
   }
 
   /**
@@ -608,6 +657,7 @@ class EcloudClient {
       if (!this.workerRunning) return;
       try {
         if (this.account.features && this.account.features.keepAlive === false) {
+          await this.syncDesktopHeartbeats(true);
           this.metrics.status = 'offline';
           this.metrics.lastHeartbeatResult = '账号级保活总开关已关闭（待命中）';
           for (const d of (this.account.desktops || [])) {
@@ -725,7 +775,7 @@ class EcloudClient {
           }
         }
 
-        // 【2026-09-26 用户拍板】原 L3（SPICE 心跳）占位层已整层删除 —— 分层巡检只保留 L1/L2。
+        await this.syncDesktopHeartbeats(!this.workerRunning);
 
         // 分层结论落日志（仅本轮确实巡检过）
         if (acted) this._logLayerSummary();
@@ -761,7 +811,10 @@ class EcloudClient {
 
   stopKeepAliveWorker() {
     this.workerRunning = false;
+    this._heartbeatGeneration = (this._heartbeatGeneration || 0) + 1;
     if (this.loopTimer) { clearTimeout(this.loopTimer); this.loopTimer = null; }
+    this.metrics.desktopHeartbeats = {};
+    if (this.engine.isReady()) this.engine.syncHeartbeats(this.sessionId, []).catch(() => {});
   }
 
   /** 账号级摘要（多机时逐台列示，避免一台的文案盖住全场） */
@@ -769,7 +822,8 @@ class EcloudClient {
     const desktops = this.account.desktops || [];
     if (desktops.length === 0) return '移动公众账号在线，暂无云电脑';
     const parts = desktops.map(d => {
-      const act = this.metrics.desktopActions[d.instanceId];
+      const heartbeat = this.metrics.desktopHeartbeats[d.instanceId];
+      const act = heartbeat ? this._desktopHeartbeatAction(heartbeat) : this.metrics.desktopActions[d.instanceId];
       return `${d.machineName || d.instanceId}: ${act ? act.text : '待巡检'}`;
     });
     return parts.join(' · ');
@@ -784,6 +838,10 @@ class EcloudClient {
    */
   _effectivePowerState(desktop) {
     const d = desktop || {};
+    const heartbeat = this.metrics.desktopHeartbeats[d.instanceId];
+    if (this.engine.isReady() && heartbeat?.state === 'healthy' && Date.now() - heartbeat.lastHeartbeatAt < 45000) {
+      return { state: 'on', evidence: '桌面心跳实时应答' };
+    }
     const platformPower = String(d.powerState || 'unknown');
     const noUptimeRecent = d._l2NoUptime === true
       && (Date.now() - (d._l2At || 0) < 15 * 60 * 1000);
@@ -800,8 +858,14 @@ class EcloudClient {
     const intervalSec = Math.max(60, parseInt(desktop.keepaliveInterval, 10) || this._l1IntervalSec());
     const last = desktop.lastKeepAliveAt || 0;
     const elapsedSec = last ? Math.floor((Date.now() - last) / 1000) : 0;
-    const act = this.metrics.desktopActions[desktop.instanceId] || null;
+    const heartbeatGate = this.resolveTask('keepAlive', desktop);
+    const heartbeat = heartbeatGate.enabled ? this.metrics.desktopHeartbeats[desktop.instanceId] : null;
     const g2 = this.resolveTask('ecloudL2DesktopReg', desktop);
+    const heartbeatMode = desktop.originCompanyCode === 'CMSSZTE';
+    const activeGate = heartbeatMode ? heartbeatGate : g2;
+    const act = heartbeatMode && !activeGate.enabled
+      ? { text: activeGate.reason || '桌面心跳已关闭', level: 'off', at: Date.now() }
+      : (heartbeat ? this._desktopHeartbeatAction(heartbeat) : (this.metrics.desktopActions[desktop.instanceId] || null));
     // ── 【2026-09-28】开关机判定加固：三条独立信号合成（唯一入口在 _effectivePowerState）──
     //   ① 平台状态 resourceStatus/powerState —— 实测会滞后（09-26 关机后仍报 available 数小时）；
     //   ② 平台操作表 powerOn.operateEnable —— 平台操作层现算（true=平台认为现在可开机）；
@@ -813,11 +877,12 @@ class EcloudClient {
     const platformPower = String(desktop.powerState || 'unknown');
     return {
       intervalSec,
+      heartbeatMode,
       elapsedSec,
       remainSec: last ? Math.max(0, intervalSec - elapsedSec) : 0,
       lastAction: act,
-      enabled: desktop.keepaliveEnabled !== false && g2.enabled,
-      disabledReason: desktop.keepaliveEnabled === false ? '单机保活开关已关闭' : (g2.enabled ? '' : g2.reason),
+      enabled: desktop.keepaliveEnabled !== false && activeGate.enabled,
+      disabledReason: desktop.keepaliveEnabled === false ? '单机保活开关已关闭' : (activeGate.enabled ? '' : activeGate.reason),
       uptime: desktop.uptime || '',
       // 开关机判定（界面唯一该看的合成口径）
       powerState,                                   // on / off / unknown
