@@ -4285,10 +4285,16 @@ function upsertLogList(list, item) {
 }
 
 function logLineInnerHtml(item) {
+  let message = item.message;
+  // 历史回放和实时更新共用中文展示，原始消息仍用于日志身份与折叠。
+  if (item.source === 'CAGTLS' && typeof message === 'string') {
+    message = message.replace(/\bprogress msg=(\d+) reply=(\d+) tick=\d+ hb=(\d+) left=(\d+s|∞)$/, (_, messages, replies, heartbeats, left) =>
+      `心跳保活：收到消息 ${messages} 条，自动应答 ${replies} 次，已发送心跳 ${heartbeats} 次，${left === '∞' ? '持续保活' : `本轮剩余 ${left.slice(0, -1)} 秒`}`);
+  }
   const repeatBadge = (item.repeatCount && item.repeatCount > 1)
     ? `<span class="badge-repeat">x${item.repeatCount}</span>`
     : '';
-  return `<span class="log-time">[${item.timestamp}]</span><span class="log-source">[${item.source}]</span><span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}`;
+  return `<span class="log-time">[${item.timestamp}]</span><span class="log-source">[${item.source}]</span><span class="log-text">${escapeHtml(message)}</span>${repeatBadge}`;
 }
 
 function createLogLineElement(item) {

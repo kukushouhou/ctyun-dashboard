@@ -123,6 +123,7 @@ function normalizeRoutineDigits(message) {
  */
 const ROUTINE_MESSAGE_PATTERNS = [
   'progress hb_sent=',   // ZTE 数据面 / 控制面心跳指标（约每 10s 一条，数字必变）
+  'progress msg=',       // ZTE IPv4/TLS + SPICE 会话进度，同类统计只保留最新一条
   'progress slow=',      // SCG（深信服）数据面 hold 进度（约每 10s 一条，数字必变；display 状态变化会自然另起一条）
   'SCG 材料探测',         // SCG firm-auth 材料巡检（presence 布尔，材料状态变化时内容才会变）
   '账号态探针通过',        // 移动公众 L1 账号态探针
