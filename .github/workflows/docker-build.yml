@@ -19,7 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 质量闸门：语法检查 + 结构性回归测试。任一失败即终止，绝不构建/推送坏镜像。
+      # 检查语法、既有回归和 CAG TLS 会话行为，通过后再构建镜像。
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -36,11 +36,8 @@ jobs:
       - name: Install sidecar dependencies
         run: pip install -r app/ecloud_engine/requirements.txt
 
-      - name: Syntax check (node --check)
-        run: node tests/syntax_check.js
-
-      - name: Regression invariants
-        run: node tests/regression.test.js
+      - name: Test syntax and regressions
+        run: npm test
 
       - name: Set up QEMU (for multi-arch)
         uses: docker/setup-qemu-action@v3
@@ -48,7 +45,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 1. 登录 GitHub Packages (GHCR)
+      # 镜像发布到当前仓库所属的 GitHub Packages (GHCR)。
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -56,44 +53,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. 登录 Docker Hub (明确绑定账号 learycn，支持 LEARYCN / DOCKERHUB_TOKEN 等 Secret)
-      - name: Log in to Docker Hub
-        id: dockerhub-login
-        continue-on-error: true
-        env:
-          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME || 'learycn' }}
-          DOCKER_PASS: ${{ secrets.LEARYCN || secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
-        if: env.DOCKER_PASS != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKER_USER }}
-          password: ${{ env.DOCKER_PASS }}
-
-      # 3. 动态配置镜像目标列表 (推送至 learycn/ctyun-dashboard 与 ghcr.io/muyicn/ctyun-dashboard)
-      - name: Determine Docker images
-        id: image-targets
-        run: |
-          IMAGES="ghcr.io/${{ github.repository }}"
-          if [ "${{ steps.dockerhub-login.outcome }}" = "success" ]; then
-            IMAGES="${IMAGES}
-          learycn/ctyun-dashboard"
-          fi
-          echo "images<<EOF" >> $GITHUB_OUTPUT
-          echo "$IMAGES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      # 4. 提取镜像元数据与多架构标签
+      # 提取镜像元数据与多架构标签。
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.image-targets.outputs.images }}
+          images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
             type=ref,event=branch
             type=semver,pattern={{version}}
 
-      # 5. 构建多架构镜像 (linux/amd64, linux/arm64) 并推送
+      # 构建多架构镜像 (linux/amd64, linux/arm64) 并推送。
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:

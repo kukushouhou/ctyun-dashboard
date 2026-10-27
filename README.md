@@ -1,5 +1,9 @@
 # 🖥️ 云电脑可视化全功能多账号管理平台（天翼云 / 移动云三平台）
 
+本仓库是 [muyicn/ctyun-dashboard](https://github.com/muyicn/ctyun-dashboard) 的分叉，基于上游 v2.3.1 修复移动爱家 ZTE IPv4/TLS 会话编号读取、子通道失败误报成功与快速重连，并增加心跳日志合并和中文显示。
+
+部署本分叉请使用 `ghcr.io/kukushouhou/ctyun-dashboard:latest`。镜像由本仓库的 GitHub Actions 在测试通过后构建，支持 `linux/amd64` 和 `linux/arm64`。会话编号解析目前覆盖标准 32 字节布局及已实测的 64 字节布局，其他布局会报错；已验证实际连接的 7 条子通道认证通过，尚未完成跨版本和超过 24 小时的保活验证。
+
 深度逆向**天翼云电脑**与**中国移动云电脑**官方通信协议，打造的**现代化、高性能、超轻量、纯原生协议、零无头浏览器**的多账号云电脑自动化保活与任务管理控制台。
 
 > ✨ **v2.3 移动公众全量融合 + SCG 底座打通 + 自动开机守护默认开启**：新增中国移动云电脑公众版（独立登录 + L1/L2 分层保活 + 开机/关机/重启 + 静默会话信号）与移动爱家「深信服 SCG」底座（官方 CEM 控制面，含开机能力恢复）；「🛡️ 自动开机守护」在移动公众与含 SCG 的移动爱家账号默认开启；30 天免登录；L3 占位层整层删除与日志降噪。
@@ -68,7 +72,7 @@
 
 1. **下载或克隆本项目**：
    ```bash
-   git clone https://github.com/muyicn/ctyun-dashboard.git
+   git clone https://github.com/kukushouhou/ctyun-dashboard.git
    cd ctyun-dashboard
    ```
 2. **直接双击运行 `start_dashboard.bat`**：
@@ -83,23 +87,13 @@
 
 #### 1. 使用 Docker CLI 一键运行：
 ```bash
-# Docker Hub 镜像 (推荐国内 NAS 用户拉取)
+# 本分叉的 GitHub Packages (GHCR) 镜像
 docker run -d \
   --name ctyun-dashboard \
   -p 8571:8571 \
   -v $(pwd)/data:/app/data \
   --restart unless-stopped \
-  learycn/ctyun-dashboard:latest
-```
-
-或使用 GitHub Packages (GHCR) 镜像：
-```bash
-docker run -d \
-  --name ctyun-dashboard \
-  -p 8571:8571 \
-  -v $(pwd)/data:/app/data \
-  --restart unless-stopped \
-  ghcr.io/muyicn/ctyun-dashboard:latest
+  ghcr.io/kukushouhou/ctyun-dashboard:latest
 ```
 
 #### 2. 使用 `docker-compose.yml` 部署：
@@ -109,7 +103,7 @@ version: '3.8'
 
 services:
   ctyun-dashboard:
-    image: learycn/ctyun-dashboard:latest # 或 ghcr.io/muyicn/ctyun-dashboard:latest
+    image: ghcr.io/kukushouhou/ctyun-dashboard:latest
     container_name: ctyun-dashboard
     restart: unless-stopped
     ports:
@@ -123,8 +117,11 @@ services:
 ```
 运行启动命令：
 ```bash
+docker compose pull
 docker compose up -d
 ```
+
+从上游镜像切换时，保留原有 `/app/data` 挂载目录及其中的隐藏文件（包括 `.master.key`），只修改镜像地址后执行上述命令，即可继续使用原有账号与配置。
 
 #### 3. 📡 移动公众（公众版）：开箱即用，可选覆盖
 
@@ -150,7 +147,7 @@ docker compose up -d
 ### 方式三：从源码直接构建运行
 
 ```bash
-git clone https://github.com/muyicn/ctyun-dashboard.git
+git clone https://github.com/kukushouhou/ctyun-dashboard.git
 cd ctyun-dashboard
 
 # 使用 Docker Compose 本地构建

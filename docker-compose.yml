@@ -3,7 +3,7 @@ version: '3.8'
 services:
   ctyun-dashboard:
     build: .
-    image: ctyun-dashboard:latest
+    image: ghcr.io/kukushouhou/ctyun-dashboard:latest
     container_name: ctyun-dashboard
     restart: unless-stopped
     ports:
