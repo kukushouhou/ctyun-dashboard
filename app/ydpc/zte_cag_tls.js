@@ -238,8 +238,9 @@ class CagMuxLink {
         return false;
       };
       if (n <= 0) { resolve(Buffer.alloc(0)); return; }
-      if (failIfClosed()) return;
       if (this._rbuf.length >= n) { resolve(this._take(n)); return; }
+      // 服务端可能把错误回包与 close 帧放在同一个 TCP 包中；先读完已收到的结果。
+      if (failIfClosed()) return;
 
       const waiter = { want: n, resolve, reject, timer: null };
       if (timeoutMs > 0) {
@@ -261,6 +262,7 @@ class CagMuxLink {
    * 返回写入字节数；data 为空时不发任何帧（与官方一致）。
    */
   write(data) {
+    if (this._closed) throw this._closeErr || new Error(`CAG mux link ${this.linkId} 已关闭`);
     const buf = Buffer.from(data || Buffer.alloc(0));
     let off = 0;
     while (off < buf.length) {
@@ -326,8 +328,8 @@ class CagMuxLink {
   _markClosed(err) {
     if (this._closed) return;
     this._closed = true;
-    this._closeErr = err || null;
-    this._rejectWaiters(err || new Error(`CAG mux link ${this.linkId} 对端已关闭`));
+    this._closeErr = err || Object.assign(new Error(`CAG mux link ${this.linkId} 对端已关闭`), { code: 'CAG_LINK_CLOSED' });
+    this._rejectWaiters(this._closeErr);
   }
 }
 
@@ -376,6 +378,7 @@ class CagMux {
   }
 
   _failAll(err) {
+    this._error = err;
     const links = Array.from(this._links.values());
     this._links.clear();
     this._rx = Buffer.alloc(0);
@@ -384,6 +387,7 @@ class CagMux {
 
   /** 开一条新链路（发出 add-link 包） */
   openLink(inner, traceId, spanId) {
+    if (this._error) throw this._error;
     if (this._closed) throw new Error('CAG mux 已关闭');
     const linkId = this._nextLinkId;
     this._nextLinkId += 1;
@@ -406,6 +410,7 @@ class CagMux {
   }
 
   writeFrame(cmd, linkId, payload) {
+    if (this._error) throw this._error;
     if (this._closed) throw new Error('CAG mux 已关闭');
     this.conn.write(packFrame(cmd, linkId, payload));
   }
@@ -528,13 +533,18 @@ function rawMessageWithPrefix(serial, msg) {
   return out;
 }
 
-/** MAIN_INIT 的 connection_id 不在 payload[:4]：用标记 0x02 00 00 00 01 定位其前 4B */
+/**
+ * MAIN_INIT 的首字段是 session_id。ZTE 64B 消息在标准字段前带 5B 封装；
+ * 标准 32B 消息则直接从偏移 0 开始。
+ * 不能搜索 02 00 00 00 01：它会命中 current_mouse_mode / agent_connected，
+ * 其前 4B 是 supported_mouse_modes（常为 3），并非 session_id。
+ */
 function zteMainInitConnectionId(payload) {
-  const marker = Buffer.from([0x02, 0x00, 0x00, 0x00, 0x01]);
-  const idx = payload.indexOf(marker);
-  if (idx >= 4) return payload.readUInt32LE(idx - 4);
-  if (payload.length >= 7) return payload.readUInt32LE(3);
-  return 0;
+  let offset;
+  if (payload.length === 64 && payload.subarray(0, 5).equals(Buffer.alloc(5))) offset = 5;
+  else if (payload.length === 32) offset = 0;
+  else throw new Error(`不支持的 MAIN_INIT 布局（${payload.length}B），无法读取会话编号`);
+  return payload.readUInt32LE(offset);
 }
 
 // ===========================================================================
@@ -718,17 +728,29 @@ async function rawMainHandshake(link, { key, vmId, linkUuid, traceId, spanId }, 
  * 且跳过 MAIN_INIT / attach / client_info 这些只属于主干的过程。
  */
 async function rawSubChannelHandshake(link, { key, vmId, linkUuid, traceId, spanId }, spiceSessionId, channelType, channelId, timeoutMs) {
+  let stage = '发送 REDQ';
   try {
     link.write(buildRawChannelREDQ(
       key, vmId, linkUuid, traceId, spanId, spiceSessionId, channelType, channelId
     ));
+    stage = '等待 REDQ 回复';
     const reply = await readRawLinkReply(link, timeoutMs);
-    if (!hasRsaPublicKeyMarker(reply)) return false;
+    // SpiceLinkReply 的 error 位于 16B 链路头之后，先保留服务端的具体拒绝码。
+    // https://www.spice-space.org/spice-protocol.html (SpiceLinkReply)
+    if (reply.length < 20) throw new Error('REDQ 回复缺少错误码');
+    const replyCode = reply.readUInt32LE(16);
+    if (replyCode !== 0) return { ok: false, stage, code: replyCode, error: `REDQ 被拒绝：result=${replyCode}` };
+    if (!hasRsaPublicKeyMarker(reply)) throw new Error('REDQ 回复没有 RSA 公钥定位标记');
+    stage = '发送 ticket';
     link.write(RAW_TICKET);
+    stage = '等待认证结果';
     const res = await link.readExact(4, timeoutMs);
-    return res.readUInt32LE(0) === 0;
+    const code = res.readUInt32LE(0);
+    return code === 0
+      ? { ok: true }
+      : { ok: false, stage, code, error: `SPICE 认证被拒绝：result=${code}` };
   } catch (e) {
-    return false;
+    return { ok: false, stage, code: e.code || null, error: String(e.message || e) };
   }
 }
 
@@ -750,29 +772,41 @@ async function setupSubChannels(mux, inner, mainLink, spiceSessionId, opts = {})
   }
 
   const authed = new Set();
+  const failures = [];
   for (const [linkId, channelType, channelId] of SUBCHANNEL_REDQS) {
     const link = links.get(linkId);
     if (!link) continue;
-    const ok = await rawSubChannelHandshake(
+    const result = await rawSubChannelHandshake(
       link,
       { key: opts.key, vmId: opts.vmId, linkUuid: mainLink.linkUuid, traceId: mainLink.traceId, spanId: mainLink.redqSpanId },
       spiceSessionId, channelType, channelId, timeoutMs
     );
-    if (!ok) continue;
-    authed.add(linkId);
-    const kind = SUBCHANNEL_INIT_KIND[linkId];
-    if (kind === 'display') link.write(rawMessageWithPrefix(1, buildZteRawDisplayInit()));
-    else if (kind === 'input') link.write(rawMessageWithPrefix(1, buildZteRawInputInit()));
+    if (result.ok) {
+      try {
+        const kind = SUBCHANNEL_INIT_KIND[linkId];
+        if (kind === 'display') link.write(rawMessageWithPrefix(1, buildZteRawDisplayInit()));
+        else if (kind === 'input') link.write(rawMessageWithPrefix(1, buildZteRawInputInit()));
+        authed.add(linkId);
+      } catch (e) {
+        Object.assign(result, { ok: false, stage: '发送通道初始化', code: e.code || null, error: String(e.message || e) });
+      }
+    }
+    if (!result.ok) {
+      failures.push({ linkId, channelType, channelId, ...result });
+      log(`子通道失败：link=${linkId} type=${channelType} id=${channelId} ` +
+        `阶段=${result.stage} code=${result.code ?? '无'}，${result.error}`, 'warning');
+      link.close();
+    }
   }
   log(`raw SPICE 子通道：开出 ${links.size} 条，认证通过 ${authed.size} 条（display=${[5, 7].filter((l) => authed.has(l)).join('/') || '无'}）`);
-  return { links, authed };
+  return { links, authed, failures };
 }
 
 /**
  * 主干保活循环（对齐 keepaliveRawSpiceLoop）。
  *
- * 每 `interval` 秒向主干补发 display/input init；当 heartbeatHz > 0 时，
- * 还以该节奏向 display 子链路注入 type=3 心跳，模拟屏幕刷新流量。
+ * 主干只处理主干消息；display/input init 已在各自子通道认证后发送一次。
+ * 当 heartbeatHz > 0 时，向 display 子链路发送 type=3 心跳。
  * 读超时被缩到心跳间隔以内，否则节奏无法兑现。
  *
  * 诚实性：本函数只**如数返回计数器**。收到消息 / 回过包 ≠ 保活被证明 ——
@@ -795,7 +829,6 @@ async function keepaliveRawSpiceLoop(mainLink, opts = {}) {
   };
   const hbIntervalMs = heartbeatHz > 0 ? 1000 / heartbeatHz : 0;
   const readTimeoutMs = hbIntervalMs > 0 ? Math.min(hbIntervalMs, 1000) : Math.min(1000, Math.max(100, interval * 1000));
-  let nextTickAt = Date.now();
   let nextHbAt = Date.now();
   let hbCounter = 0;
   let hbSeq = 0;
@@ -813,29 +846,16 @@ async function keepaliveRawSpiceLoop(mainLink, opts = {}) {
       if (e && e.code === 'ETIMEDOUT') {
         // 读超时是常态（服务端只在有事件时才发）
       } else {
+        if (shouldStop && shouldStop()) break;
         counters.errors += 1;
-        if (counters.messages === 0 && counters.ticks === 0) {
-          log(`raw SPICE 主干读取中断：${e && e.message ? e.message : e}`, 'warning');
-        }
+        counters.error = `主干读取中断：${e && e.message ? e.message : e}`;
         break;
       }
     }
 
     const now = Date.now();
-    if (now >= nextTickAt) {
-      try {
-        mainLink.write(rawMessageWithPrefix(state.nextSerial(), buildZteRawDisplayInit()));
-        mainLink.write(rawMessageWithPrefix(state.nextSerial(), buildZteRawInputInit()));
-        counters.ticks += 1;
-      } catch (e) {
-        counters.errors += 1;
-        break;
-      }
-      nextTickAt = now + interval * 1000;
-    }
-
     if (hbIntervalMs > 0 && now >= nextHbAt) {
-      const targets = displayLinks && displayLinks.length > 0 ? displayLinks : [mainLink];
+      const targets = displayLinks || [];
       try {
         const suffix = state.lastSuffix && state.lastSuffix.length > 0 ? state.lastSuffix : Buffer.alloc(5);
         const hbMsg = Buffer.concat([
@@ -847,7 +867,9 @@ async function keepaliveRawSpiceLoop(mainLink, opts = {}) {
         hbSeq += 1;
         if (hbSeq % 5 === 0) hbCounter = (hbCounter + 250) & 0xffffffff;
       } catch (e) {
+        if (shouldStop && shouldStop()) break;
         counters.errors += 1;
+        counters.error = `显示通道心跳中断：${e && e.message ? e.message : e}`;
         break;
       }
       nextHbAt = now + hbIntervalMs;
@@ -893,7 +915,7 @@ function upgradeToTls(socket, { host, allowInsecure, onLog }) {
     const stream = tls.connect(options, () => resolve(stream));
     stream.once('error', (err) => {
       if (typeof onLog === 'function' && allowInsecure === false) {
-        onLog(`TLS 握手失败（${host}）：${(err && err.code) || (err && err.message) || err}`, 'warning');
+        onLog('CAGTLS', `TLS 握手失败（${host}）：${(err && err.code) || (err && err.message) || err}`, 'warning');
       }
       reject(err);
     });
@@ -1063,6 +1085,8 @@ async function runTlsSpiceSession(opts) {
   const mux = CagMux.open(dial.socket);
   let mainLink;
   try {
+    if (typeof opts.onSocket === 'function') opts.onSocket(dial.socket);
+    if (shouldStop && shouldStop()) return { sessionEstablished: false, stopped: true };
     const traceId = opts.traceId || randomHex(16);
     mainLink = mux.openLink({ host: innerHost, port: innerPort }, traceId);
     const hs = await rawMainHandshake(
@@ -1072,14 +1096,27 @@ async function runTlsSpiceSession(opts) {
     );
     if (!hs.ok) throw new Error(`raw SPICE 主干握手失败：${hs.error}`);
 
-    const { links, authed } = await setupSubChannels(
+    const { links, authed, failures } = await setupSubChannels(
       mux, { host: innerHost, port: innerPort }, mainLink, hs.spiceSessionId,
       { key, vmId, timeoutMs: 8000, onLog }
     );
 
     const displayLinks = [];
     for (const [linkId, link] of links) {
-      if (SUBCHANNEL_INIT_KIND[linkId] === 'display' && authed.has(linkId)) displayLinks.push(link);
+      if (SUBCHANNEL_INIT_KIND[linkId] === 'display' && authed.has(linkId) && !link._closed) displayLinks.push(link);
+    }
+
+    if (shouldStop && shouldStop()) return { sessionEstablished: false, stopped: true };
+    if (mainLink._closed) {
+      throw Object.assign(new Error('raw SPICE 主干在子通道初始化期间已关闭'), { code: 'SPICE_SESSION_INTERRUPTED' });
+    }
+    if (displayLinks.length === 0) {
+      const detail = failures.find((f) => SUBCHANNEL_INIT_KIND[f.linkId] === 'display');
+      const error = new Error(`raw SPICE 显示子通道未就绪（认证 ${authed.size}/${links.size}）` +
+        (detail ? `：link=${detail.linkId} ${detail.stage}，${detail.error}` : ''));
+      error.code = 'SPICE_DISPLAY_NOT_READY';
+      error.failures = failures;
+      throw error;
     }
 
     // 会话已建立（≠ 保活已被证明）—— 立刻回调一次，让上层能实时打日志/记动作，
@@ -1104,6 +1141,12 @@ async function runTlsSpiceSession(opts) {
       onLog,
       shouldStop
     });
+
+    if (counters.errors > 0) {
+      const error = new Error(`raw SPICE 会话提前中断（${Math.round((Date.now() - started) / 1000)}s/${holdSeconds}s）：${counters.error}`);
+      error.code = 'SPICE_SESSION_INTERRUPTED';
+      throw error;
+    }
 
     return {
       sessionEstablished: true,

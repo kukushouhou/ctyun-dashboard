@@ -780,6 +780,8 @@ class YdpcClient {
   isDataPlaneActive(usid) {
     const task = this.dataPlaneTasks.get(String(usid));
     if (!task || !task.running) return false;
+    // TLS 路径必须已经通过显示通道认证；拨号中和失败后的等待期不算在场。
+    if (task.path === 'tls' && task.tlsEstablished !== true) return false;
     return (task.failStreak || 0) < DATA_PLANE_FAIL_LIMIT;
   }
 
@@ -1248,33 +1250,46 @@ class YdpcClient {
 
           if (innerRoute.path === 'tls') {
             // ── IPv4 分支：官方"经典"数据面 —— 也是唯一会建立 Display Surface 的通道 ──
-            const session = await runTlsSpiceSession({
-              outerHost: String(firmAuth.cagIp),
-              outerPort: Number(firmAuth.cagPort),
-              innerHost,
-              innerPort,
-              proxySport: Number(p.spicePort),
-              vmId,
-              key: p.sessionKey,
-              traceId: p.traceId,
-              timeoutMs: 15000,
-              holdSeconds: HOLD_SLICE_S,
-              onLog: (label, message, level) => this.appendLog(label, `[${name}] ${message}`, level, name, 'ydpc'),
-              onEstablished: (info) => {
-                this.appendLog(
-                  'CAGTLS',
-                  `[${name}] ✅ 数据面会话已建立 (conv=${info.conv} spice=${info.spiceSessionId} ` +
-                  `子通道 ${info.authedSubLinks}/${info.subLinks}，display ${info.displaySubLinks} 条` +
-                  `${info.tlsDowngraded ? '，TLS 已按受控降级建立' : ''})，` +
-                  `hold ${Math.round(HOLD_SLICE_S / 60)} 分钟`,
-                  'success', name, 'ydpc'
-                );
-                // 隧道**当场**建成 ⇒ 立刻清零失败计数。不能等 15 分钟切片结束再清：
-                // 否则一次早期瞬时抖动会把"已交还控制面"的降级状态焊住整整一个切片。
-                this._noteDataPlaneProgress(task, usid, name);
-              },
-              shouldStop: () => task.stopFlag || !task.running
-            });
+            task.tlsEstablished = false;
+            let session;
+            try {
+              session = await runTlsSpiceSession({
+                outerHost: String(firmAuth.cagIp),
+                outerPort: Number(firmAuth.cagPort),
+                innerHost,
+                innerPort,
+                proxySport: Number(p.spicePort),
+                vmId,
+                key: p.sessionKey,
+                traceId: p.traceId,
+                timeoutMs: 15000,
+                holdSeconds: HOLD_SLICE_S,
+                onLog: (label, message, level) => this.appendLog(label, `[${name}] ${message}`, level, name, 'ydpc'),
+                onSocket: (socket) => {
+                  task.socket = socket;
+                  if (task.stopFlag || !task.running) socket.destroy();
+                },
+                onEstablished: (info) => {
+                  task.tlsEstablished = true;
+                  this.appendLog(
+                    'CAGTLS',
+                    `[${name}] ✅ 数据面会话已建立 (conv=${info.conv} spice=${info.spiceSessionId} ` +
+                    `子通道 ${info.authedSubLinks}/${info.subLinks}，display ${info.displaySubLinks} 条` +
+                    `${info.tlsDowngraded ? '，TLS 已按受控降级建立' : ''})，` +
+                    `hold ${Math.round(HOLD_SLICE_S / 60)} 分钟`,
+                    'success', name, 'ydpc'
+                  );
+                  // 隧道**当场**建成 ⇒ 立刻清零失败计数。不能等 15 分钟切片结束再清：
+                  // 否则一次早期瞬时抖动会把"已交还控制面"的降级状态焊住整整一个切片。
+                  this._noteDataPlaneProgress(task, usid, name);
+                },
+                shouldStop: () => task.stopFlag || !task.running
+              });
+            } finally {
+              task.tlsEstablished = false;
+              task.socket = null;
+            }
+            if (task.stopFlag || !task.running) break;
             // 措辞与 raw 分支同一口径：只说"切片完成 / 重拨"，**绝不说"保活成功"** ——
             // 会话建立不等于保活被证明（见 keepaliveProven 恒 false 的诚实性口径）。
             this._recordVmAction(
